@@ -3,6 +3,7 @@
 import json
 import time
 import tkinter as tk
+from tkinter import filedialog
 from pathlib import Path
 
 import cv2
@@ -10,8 +11,16 @@ from pythonosc.udp_client import SimpleUDPClient
 from ultralytics import YOLO
 
 # ---------------- CONFIG ----------------
+VIDEO_CHOICE = -1  # valor do radio 'Vídeo' no painel de fonte
 MAX_CAMERAS = 5  # índices 0..N-1 testados na escolha da webcam
 MODEL_PATH = "yolov8n.pt"
+POSE_MODEL_PATH = "yolov8n-pose.pt"
+POSE_KP_CONF = 0.5  # confiança mínima do keypoint para desenhar
+KEYPOINT_NAMES = ["nose", "eye_l", "eye_r", "ear_l", "ear_r", "shoulder_l", "shoulder_r",
+                  "elbow_l", "elbow_r", "wrist_l", "wrist_r", "hip_l", "hip_r",
+                  "knee_l", "knee_r", "ankle_l", "ankle_r"]
+SKELETON = [(0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+            (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)]
 CONF_THRESHOLD = 0.4
 
 OSC_HOST = "127.0.0.1"
@@ -29,6 +38,7 @@ COLOR_MOVING = (0, 255, 0)
 COLOR_STOPPED = (0, 0, 255)
 COLOR_LINE = (255, 255, 0)
 COLOR_TEXT = (255, 255, 255)
+COLOR_POSE = (255, 0, 255)
 # -----------------------------------------
 
 
@@ -58,28 +68,51 @@ def list_cameras():
 
 
 def show_camera_panel(config):
-    """Painel de escolha da webcam. Devolve o índice, ou None se fechado sem Next."""
+    """Painel de escolha da fonte. Devolve índice da webcam ou caminho do vídeo, ou None se fechado sem Next."""
     cameras = list_cameras()
-    if not cameras:
-        raise RuntimeError("Nenhuma webcam encontrada. Verifica permissões de câmara no macOS.")
 
     root = tk.Tk()
-    root.title("Webcam")
-    default = config["camera"] if config["camera"] in cameras else cameras[0]
+    root.title("Fonte")
+    current = config["camera"]
+    video_path = tk.StringVar(master=root, value=current if isinstance(current, str) else "")
+    if isinstance(current, str):
+        default = VIDEO_CHOICE
+    else:
+        default = current if current in cameras else (cameras[0] if cameras else VIDEO_CHOICE)
     choice = tk.IntVar(master=root, value=default)
+    error_var = tk.StringVar(master=root)
     result = {}
 
     def on_next():
-        result["camera"] = choice.get()
+        if choice.get() == VIDEO_CHOICE:
+            if not video_path.get():
+                error_var.set("Escolhe um ficheiro de vídeo.")
+                return
+            result["source"] = video_path.get()
+        else:
+            result["source"] = choice.get()
         root.destroy()
 
+    def on_browse():
+        path = filedialog.askopenfilename(
+            parent=root, filetypes=[("Vídeo", "*.mp4 *.mov *.avi *.mkv *.m4v"), ("Todos", "*.*")])
+        if path:
+            video_path.set(path)
+            choice.set(VIDEO_CHOICE)
+            error_var.set("")
+
     for i in cameras:
-        label = f"Camera {i}"
-        tk.Radiobutton(root, text=label, variable=choice, value=i).pack(anchor="w", padx=16, pady=2)
+        tk.Radiobutton(root, text=f"Camera {i}", variable=choice, value=i).pack(anchor="w", padx=16, pady=2)
+    row = tk.Frame(root)
+    row.pack(anchor="w", padx=16, pady=2, fill="x")
+    tk.Radiobutton(row, text="Vídeo (loop)", variable=choice, value=VIDEO_CHOICE).pack(side="left")
+    tk.Button(row, text="Procurar...", command=on_browse).pack(side="left", padx=8)
+    tk.Label(root, textvariable=video_path, anchor="w", wraplength=360).pack(anchor="w", padx=16)
+    tk.Label(root, textvariable=error_var, fg="red").pack(anchor="w", padx=16)
     tk.Button(root, text="Next", command=on_next).pack(side="right", padx=8, pady=8)
 
     root.mainloop()
-    return result.get("camera")
+    return result.get("source")
 
 
 def show_panel(names, config):
@@ -136,8 +169,28 @@ def show_panel(names, config):
     return result.get("config")
 
 
+def draw_skeletons(frame, result, osc):
+    if result.keypoints is None or result.boxes.id is None:
+        return
+    h, w = frame.shape[:2]
+    kps = result.keypoints.xy.cpu().numpy()
+    confs = result.keypoints.conf.cpu().numpy()
+    ids = result.boxes.id.cpu().numpy().astype(int)
+    for track_id, pts, cf in zip(ids, kps, confs):
+        for name, (x, y), c in zip(KEYPOINT_NAMES, pts, cf):
+            osc.send_message(f"/skeleton/{int(track_id)}/{name}", [float(x / w), float(y / h), float(c)])
+        for a, b in SKELETON:
+            if cf[a] > POSE_KP_CONF and cf[b] > POSE_KP_CONF:
+                cv2.line(frame, (int(pts[a][0]), int(pts[a][1])),
+                         (int(pts[b][0]), int(pts[b][1])), COLOR_POSE, 2)
+        for (x, y), c in zip(pts, cf):
+            if c > POSE_KP_CONF:
+                cv2.circle(frame, (int(x), int(y)), 4, COLOR_POSE, -1)
+
+
 def main():
     model = YOLO(MODEL_PATH)
+    pose_model = YOLO(POSE_MODEL_PATH)
 
     config = load_config()
     if config["show_on_start"]:
@@ -155,7 +208,7 @@ def main():
 
     cap = cv2.VideoCapture(config["camera"])
     if not cap.isOpened():
-        raise RuntimeError("Não foi possível abrir a webcam. Verifica permissões de câmara no macOS.")
+        raise RuntimeError("Não foi possível abrir a fonte (webcam ou vídeo). Verifica permissões de câmara no macOS.")
 
     track_history = {}  # id -> lista de centróides (x, y)
     counted_ids = set()  # ids já contados neste cruzamento (evita contagem dupla seguida)
@@ -164,27 +217,45 @@ def main():
 
     line_y = None
     show_line = True
+    show_objects = True
+    show_pose = False
 
     while True:
         ok, frame = cap.read()
+        if not ok and isinstance(config["camera"], str):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # vídeo em loop
+            ok, frame = cap.read()
         if not ok:
             break
 
         if line_y is None:
             line_y = int(frame.shape[0] * LINE_Y_RATIO)
 
-        results = model.track(
-            frame,
-            persist=True,
-            classes=config["classes"],
-            conf=CONF_THRESHOLD,
-            tracker="bytetrack.yaml",
-            verbose=False,
-        )
+        results = None
+        if show_objects:
+            results = model.track(
+                frame,
+                persist=True,
+                classes=config["classes"],
+                conf=CONF_THRESHOLD,
+                tracker="bytetrack.yaml",
+                verbose=False,
+            )
 
+        pose_results = None
+        if show_pose:
+            pose_results = pose_model.track(
+                frame,
+                persist=True,
+                conf=CONF_THRESHOLD,
+                tracker="bytetrack.yaml",
+                verbose=False,
+            )
+
+        has_tracks = results is not None and results[0].boxes is not None and results[0].boxes.id is not None
         visible_count = 0
 
-        if results[0].boxes is not None and results[0].boxes.id is not None:
+        if has_tracks:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             ids = results[0].boxes.id.cpu().numpy().astype(int)
             class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
@@ -240,7 +311,7 @@ def main():
                 cv2.circle(frame, (int(cx), int(cy)), 3, color, -1)
 
         # remove históricos de ids que já não aparecem (evita crescimento infinito)
-        if results[0].boxes is not None and results[0].boxes.id is not None:
+        if has_tracks:
             active_ids = set(ids.tolist())
         else:
             active_ids = set()
@@ -249,6 +320,9 @@ def main():
                 track_history.pop(old_id, None)
                 counted_ids.discard(old_id)
                 osc.send_message("/lost", int(old_id))
+
+        if pose_results is not None:
+            draw_skeletons(frame, pose_results[0], osc)
 
         if show_line:
             cv2.line(frame, (0, line_y), (frame.shape[1], line_y), COLOR_LINE, 2)
@@ -261,8 +335,12 @@ def main():
             f"Entradas: {entries}  Saidas: {exits}  Dentro: {total}",
             f"Visiveis agora: {visible_count}",
         ]
+        shortcuts = (f"[p] pose:{'on' if show_pose else 'off'}  [o] objects:{'on' if show_objects else 'off'}  "
+                     "[l] linha  [c] classes  [q] sair")
+        cv2.putText(frame, shortcuts, (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 2)
         for i, text in enumerate(info_lines):
-            cv2.putText(frame, text, (10, 30 + i * 25),
+            cv2.putText(frame, text, (10, 55 + i * 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_TEXT, 2)
 
         cv2.imshow("Tracking de Pessoas (YOLOv8 + ByteTrack)", frame)
@@ -270,6 +348,10 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
+        if key == ord("p"):
+            show_pose = not show_pose
+        if key == ord("o"):
+            show_objects = not show_objects
         if key == ord("l"):
             show_line = not show_line
         if key == ord("c"):
