@@ -1,15 +1,25 @@
 # YOLO Tracking → TouchDesigner
 
+![Preview](yolo_td_preview_600x400.gif)
+
 Real-time object/person detection, tracking and counting from a webcam ([YOLOv8](https://github.com/ultralytics/ultralytics) + ByteTrack). Sends data over OSC, e.g. to TouchDesigner.
 
 ## Features
 
-- Webcam and class selection panels on startup
+- Source (webcam or looping video) and classifier selection panels on startup
 - Tracking with persistent IDs (ByteTrack)
-- Per-target state: moving / stopped
-- Marker showing class, ID and state (`person ID 3 move`)
-- Counting line with entries, exits and total inside
+- Per-target state: moving (green) / stopped (red)
+- Marker showing class and ID (`person ID 3`)
+- Optional pose skeleton overlay, sent per keypoint over OSC
+- Live FPS limit and resolution switching (default 24 FPS, 1280x720)
 - Data output over OSC
+- Counting line (entries / exits / inside) is currently disabled (commented out in `main.py`)
+
+## Classifiers
+
+Class selection panel (`Classifier Selector`):
+
+![YOLO classifiers](yolo-classifiers.png)
 
 ## Requirements
 
@@ -38,9 +48,14 @@ On macOS you can also double-click `run.command`.
 
 | Key | Action |
 |-----|--------|
-| `q` | Quit |
-| `c` | Reopen class selection panel |
-| `l` | Show / hide the counting line |
+| `p` | Toggle pose skeleton |
+| `o` | Toggle object detection |
+| `c` | Reopen classifier selection panel |
+| `q` / `w` | Previous / next FPS limit (12, 15, 24, 30, 60) |
+| `a` / `s` | Previous / next resolution (640x360, 960x540, 1280x720, 1920x1080) |
+| `Esc` | Quit |
+
+All shortcuts are also shown in the preview window.
 
 ## Configuration
 
@@ -50,15 +65,19 @@ On macOS you can also double-click `run.command`.
 {
   "camera": 0,
   "classes": [0],
-  "show_on_start": true
+  "show_on_start": true,
+  "fps": 24,
+  "resolution": [1280, 720]
 }
 ```
 
-- `camera`: webcam index
+- `camera`: webcam index, or path to a video file (played in loop)
 - `classes`: COCO class IDs (0 = person)
 - `show_on_start`: show the panels on startup
+- `fps`: FPS limit (updated by the `q` / `w` keys)
+- `resolution`: `[width, height]` (updated by the `a` / `s` keys)
 
-Constants at the top of `main.py`: `CONF_THRESHOLD`, `LINE_Y_RATIO`, `MOVEMENT_THRESHOLD_PX`, `OSC_HOST`, `OSC_PORT`.
+Constants at the top of `main.py`: `CONF_THRESHOLD`, `POSE_KP_CONF`, `MOVEMENT_THRESHOLD_PX`, `OSC_HOST`, `OSC_PORT`.
 
 ## OSC
 
@@ -71,9 +90,7 @@ Default destination: `127.0.0.1:9000`.
 | `/target/<id>/w`, `/h` | size, normalized 0..1 |
 | `/target/<id>/state` | 1 = moving, 0 = stopped |
 | `/lost` | ID of a target that disappeared |
-| `/count/entries` | total entries (crossing the line top to bottom) |
-| `/count/exits` | total exits (bottom to top) |
-| `/count/inside` | entries − exits |
+| `/skeleton/<id>/<keypoint>` | x, y (normalized 0..1), confidence (pose on) |
 
 ## Troubleshooting
 

@@ -27,7 +27,10 @@ OSC_HOST = "127.0.0.1"
 OSC_PORT = 9000
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
-DEFAULT_CONFIG = {"camera": 0, "classes": [0], "show_on_start": True}  # 0 = person
+DEFAULT_CONFIG = {"camera": 0, "classes": [0], "show_on_start": True,  # 0 = person
+                  "fps": 24, "resolution": [1280, 720]}
+FPS_PRESETS = [12, 15, 24, 30, 60]
+RES_PRESETS = [(640, 360), (960, 540), (1280, 720), (1920, 1080)]
 PANEL_COLUMNS = 3
 PANEL_SIZE = (900, 700)  # largura, altura da lista
 
@@ -72,7 +75,7 @@ def show_camera_panel(config):
     cameras = list_cameras()
 
     root = tk.Tk()
-    root.title("Fonte")
+    root.title("Source")
     current = config["camera"]
     video_path = tk.StringVar(master=root, value=current if isinstance(current, str) else "")
     if isinstance(current, str):
@@ -118,7 +121,7 @@ def show_camera_panel(config):
 def show_panel(names, config):
     """Painel com toggles por classe. Devolve a nova config, ou None se fechado sem Start."""
     root = tk.Tk()
-    root.title("Classes a detetar")
+    root.title("Classifier Selector")
 
     selected = {cid: tk.BooleanVar(master=root, value=cid in config["classes"]) for cid in names}
     show_var = tk.BooleanVar(master=root, value=config["show_on_start"])
@@ -206,21 +209,37 @@ def main():
 
     osc = SimpleUDPClient(OSC_HOST, OSC_PORT)
 
+    fps_idx = FPS_PRESETS.index(config["fps"]) if config["fps"] in FPS_PRESETS else FPS_PRESETS.index(DEFAULT_CONFIG["fps"])
+    res = tuple(config["resolution"])
+    res_idx = RES_PRESETS.index(res) if res in RES_PRESETS else RES_PRESETS.index(tuple(DEFAULT_CONFIG["resolution"]))
+
     cap = cv2.VideoCapture(config["camera"])
     if not cap.isOpened():
         raise RuntimeError("Não foi possível abrir a fonte (webcam ou vídeo). Verifica permissões de câmara no macOS.")
+    if isinstance(config["camera"], int):
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, RES_PRESETS[res_idx][0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RES_PRESETS[res_idx][1])
 
     track_history = {}  # id -> lista de centróides (x, y)
     counted_ids = set()  # ids já contados neste cruzamento (evita contagem dupla seguida)
-    entries = 0
-    exits = 0
+    # entries = 0
+    # exits = 0
 
-    line_y = None
-    show_line = True
+    # line_y = None
+    # show_line = True
     show_objects = True
     show_pose = False
 
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = 0.0
+    last_start = time.perf_counter()
+
     while True:
+        frame_start = time.perf_counter()
+        fps_now = 1 / max(frame_start - last_start, 1e-6)
+        fps = 0.9 * fps + 0.1 * fps_now if fps else fps_now
+        last_start = frame_start
+
         ok, frame = cap.read()
         if not ok and isinstance(config["camera"], str):
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # vídeo em loop
@@ -228,8 +247,9 @@ def main():
         if not ok:
             break
 
-        if line_y is None:
-            line_y = int(frame.shape[0] * LINE_Y_RATIO)
+        frame = cv2.resize(frame, RES_PRESETS[res_idx])
+        # if line_y is None:
+            # line_y = int(frame.shape[0] * LINE_Y_RATIO)
 
         results = None
         if show_objects:
@@ -289,25 +309,25 @@ def main():
                 osc.send_message(f"{base}/h", float((y2 - y1) / frame_h))
                 osc.send_message(f"{base}/state", int(is_moving))
 
-                # deteção de cruzamento de linha (usa posição anterior vs atual)
-                if len(history) >= 2:
-                    prev_y = history[-2][1]
-                    crossed_down = prev_y < line_y <= cy
-                    crossed_up = prev_y > line_y >= cy
+                # # deteção de cruzamento de linha (usa posição anterior vs atual)
+                # if len(history) >= 2:
+                    # prev_y = history[-2][1]
+                    # crossed_down = prev_y < line_y <= cy
+                    # crossed_up = prev_y > line_y >= cy
 
-                    if crossed_down and track_id not in counted_ids:
-                        entries += 1
-                        counted_ids.add(track_id)
-                    elif crossed_up and track_id not in counted_ids:
-                        exits += 1
-                        counted_ids.add(track_id)
-                    elif not crossed_down and not crossed_up:
-                        counted_ids.discard(track_id)
+                    # if crossed_down and track_id not in counted_ids:
+                        # entries += 1
+                        # counted_ids.add(track_id)
+                    # elif crossed_up and track_id not in counted_ids:
+                        # exits += 1
+                        # counted_ids.add(track_id)
+                    # elif not crossed_down and not crossed_up:
+                        # counted_ids.discard(track_id)
 
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                label = f"{model.names[class_id]} ID {track_id} {'move' if is_moving else 'parado'}"
-                cv2.putText(frame, label, (int(x1), int(y1) - 12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+                label = f"{model.names[class_id]} ID {track_id}"
+                cv2.putText(frame, label, (int(x1), int(y1) - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 cv2.circle(frame, (int(cx), int(cy)), 3, color, -1)
 
         # remove históricos de ids que já não aparecem (evita crescimento infinito)
@@ -324,36 +344,54 @@ def main():
         if pose_results is not None:
             draw_skeletons(frame, pose_results[0], osc)
 
-        if show_line:
-            cv2.line(frame, (0, line_y), (frame.shape[1], line_y), COLOR_LINE, 2)
+        # if show_line:
+            # cv2.line(frame, (0, line_y), (frame.shape[1], line_y), COLOR_LINE, 2)
 
-        total = entries - exits
-        osc.send_message("/count/entries", entries)
-        osc.send_message("/count/exits", exits)
-        osc.send_message("/count/inside", total)
+        # total = entries - exits
+        # osc.send_message("/count/entries", entries)
+        # osc.send_message("/count/exits", exits)
+        # osc.send_message("/count/inside", total)
         info_lines = [
-            f"Entradas: {entries}  Saidas: {exits}  Dentro: {total}",
-            f"Visiveis agora: {visible_count}",
+            # f"Entradas: {entries}  Saidas: {exits}  Dentro: {total}",
+            f"Visible Persons: {visible_count}",
+            f"FPS: {fps:.1f} / {FPS_PRESETS[fps_idx]}  (fonte: {source_fps:.0f})  |  {RES_PRESETS[res_idx][0]}x{RES_PRESETS[res_idx][1]}",
         ]
-        shortcuts = (f"[p] pose:{'on' if show_pose else 'off'}  [o] objects:{'on' if show_objects else 'off'}  "
-                     "[l] linha  [c] classes  [q] sair")
-        cv2.putText(frame, shortcuts, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 2)
+        shortcut_lines = [
+            f"[p] pose:{'on' if show_pose else 'off'}  [o] objects:{'on' if show_objects else 'off'}  "
+            "[c] classes  [esc] sair",
+            "[q/w] FPS -/+  [a/s] resolucao -/+",
+        ]
+        for i, text in enumerate(shortcut_lines):
+            cv2.putText(frame, text, (10, 25 + i * 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 2)
         for i, text in enumerate(info_lines):
-            cv2.putText(frame, text, (10, 55 + i * 25),
+            cv2.putText(frame, text, (10, 85 + i * 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_TEXT, 2)
 
-        cv2.imshow("Tracking de Pessoas (YOLOv8 + ByteTrack)", frame)
+        cv2.imshow("Person/Object Tracker -  YOLO + Bytetrack", frame)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
+        if key == 27:  # esc
             break
+        if key in (ord("q"), ord("w")):
+            fps_idx = max(0, min(len(FPS_PRESETS) - 1, fps_idx + (1 if key == ord("w") else -1)))
+            config["fps"] = FPS_PRESETS[fps_idx]
+            save_config(config)
+        if key in (ord("a"), ord("s")):
+            new_idx = max(0, min(len(RES_PRESETS) - 1, res_idx + (1 if key == ord("s") else -1)))
+            if new_idx != res_idx:
+                res_idx = new_idx
+                config["resolution"] = list(RES_PRESETS[res_idx])
+                save_config(config)
+                # line_y = None
+                track_history.clear()
+                counted_ids.clear()
         if key == ord("p"):
             show_pose = not show_pose
         if key == ord("o"):
             show_objects = not show_objects
-        if key == ord("l"):
-            show_line = not show_line
+        # if key == ord("l"):
+            # show_line = not show_line
         if key == ord("c"):
             cv2.destroyAllWindows()
             cv2.waitKey(1)
@@ -361,6 +399,10 @@ def main():
             if new_config is not None:
                 config = {**config, **new_config}
                 save_config(config)
+
+        remaining = frame_start + 1 / FPS_PRESETS[fps_idx] - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
 
     cap.release()
     cv2.destroyAllWindows()
