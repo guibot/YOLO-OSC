@@ -19,7 +19,7 @@ Real-time object/person detection, tracking and counting from a webcam ([YOLOv8]
 
 Class selection panel (`Classifier Selector`):
 
-![YOLO classifiers](yolo-classifiers.png)
+<img src="yolo-classifiers.png" alt="YOLO classifiers" width="300">
 
 ## Requirements
 
